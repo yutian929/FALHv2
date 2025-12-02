@@ -1,0 +1,9 @@
+{
+    "cam_intri_path": "/home/yutian/ros2_ws/camera_data/cam_intri.json",
+    "color_dir": "/home/yutian/ros2_ws/camera_data/color/",
+    "depth_dir": "/home/yutian/ros2_ws/camera_data/depth/",
+    "cam_traj_dir": "/home/yutian/ros2_ws/camera_data/cam_traj/",
+
+    "BAR_LENGTH": 1.0,
+    "CAM_FOV": 60
+}
