@@ -4,23 +4,25 @@ import matplotlib.patches as patches
 from scipy.spatial.transform import Rotation as R
 import os
 import glob
+import json
 
 class StateBar:
     """
     存储单个状态栏的信息
     """
-    def __init__(self, bar_id, global_start_dist, length):
+    def __init__(self, bar_id, global_start_dist, length, cam_intri=None):
         self.id = bar_id
         self.global_start_dist = global_start_dist
         self.length = length
+        self.cam_intri = cam_intri # 存储引用，所有Bar共享同一份内存
         
         # 状态标志
         self.is_empty = True
         
         # 存储的数据 (根据需求定义)
         self.data = {
-            "color": None,
-            "depth": None,
+            "color": None,  # RGB 图像路径或数据
+            "depth": None,  # 深度图路径或数据
             "cam_mat": None, # 4x4 transformation matrix
             "update_step": -1 # 记录最后一次更新的时间步/索引
         }
@@ -33,31 +35,140 @@ class StateBar:
         self.data["cam_mat"] = cam_mat
         self.data["update_step"] = step_idx
         # print(f"[StateBar {self.id}] Updated.")
+    
+    def _get_color_np(self):
+        """获取存储的颜色图像为 numpy 数组"""
+        color_entry = self.data.get("color", None)
+        if color_entry is None:
+            return None
+
+        img = None
+        # 如果是路径字符串，则尝试读取文件
+        if isinstance(color_entry, str):
+            if os.path.exists(color_entry):
+                try:
+                    img = plt.imread(color_entry)
+                except Exception:
+                    img = None
+        # 如果已经是 numpy 数组，直接使用
+        elif isinstance(color_entry, np.ndarray):
+            img = color_entry
+
+        return img
+    
+    def _get_depth_np(self):
+        """获取存储的深度图为 numpy 数组"""
+        depth_entry = self.data.get("depth", None)
+        if depth_entry is None:
+            return None
+
+        depth_map = None
+        # 如果是路径字符串，则尝试读取文件
+        if isinstance(depth_entry, str):
+            if os.path.exists(depth_entry):
+                try:
+                    if depth_entry.endswith('.npy'):
+                        depth_map = np.load(depth_entry)
+                    else:
+                        depth_map = plt.imread(depth_entry)
+                except Exception:
+                    depth_map = None
+        # 如果已经是 numpy 数组，直接使用
+        elif isinstance(depth_entry, np.ndarray):
+            depth_map = depth_entry
+
+        return depth_map
+    
+    def _get_cam_mat(self):
+        """获取存储的相机矩阵 numpy 数组"""
+        return self.data.get("cam_mat", None)
 
     def __repr__(self):
         status = "EMPTY" if self.is_empty else "HAS_DATA"
         return f"<StateBar {self.id}: {status}, Range=[{self.global_start_dist:.1f}, {self.global_start_dist+self.length:.1f}]>"
     
-    def visualize(self):
-        """可视化当前状态栏的信息 (调试用)"""
-        if self.is_empty:
-            return f"StateBar {self.id}: EMPTY"
-        else:
-            return f"StateBar {self.id}: Color={self.data['color']}, Depth={self.data['depth']}"
+    def get_mask_pcd(self, mask):
+        """
+        根据存储的RGB图、深度图和相机矩阵，提取指定 mask 区域的点云
+        :param mask: 2D binary mask (numpy array)
+        :return: Nx6(xyzrgb) 点云 (numpy array) 或 None
+        """
+        color_img = self._get_color_np()
+        depth_map = self._get_depth_np()
+        cam_mat = self._get_cam_mat()
+        
+        if color_img is None or depth_map is None or cam_mat is None:
+            return None
+        
+        if mask.shape != depth_map.shape:
+            print(f"[StateBar {self.id}] Mask shape {mask.shape} does not match depth map shape {depth_map.shape}.")
+            return None
+        
+        # 默认相机内参
+        fx = fy = 525.0
+        cx = color_img.shape[1] / 2.0
+        cy = color_img.shape[0] / 2.0
+
+        # 如果有加载的内参，则覆盖默认值
+        if self.cam_intri:
+            # 此时 self.cam_intri 已经是解析好的标准字典 {"fx":..., "fy":..., "cx":..., "cy":...}
+            fx = self.cam_intri.get("fx", fx)
+            fy = self.cam_intri.get("fy", fy)
+            cx = self.cam_intri.get("cx", cx)
+            cy = self.cam_intri.get("cy", cy)
+        
+        points = []
+        
+        for v in range(depth_map.shape[0]):
+            for u in range(depth_map.shape[1]):
+                if mask[v, u]:
+                    z = depth_map[v, u]
+                    if z == 0:
+                        continue
+                    x = (u - cx) * z / fx
+                    y = (v - cy) * z / fy
+                    
+                    # 转换到世界坐标系
+                    point_cam = np.array([x, y, z, 1.0])
+                    point_world = cam_mat @ point_cam
+                    point_world = point_world[:3] / point_world[3]
+                    
+                    color_pixel = color_img[v, u, :3] if color_img.ndim == 3 else np.array([color_img[v, u]]*3)
+                    points.append(np.concatenate([point_world, color_pixel]))
+        
+        if len(points) == 0:
+            return None
+        
+        return np.array(points)  # Nx6 array
+
+
 
 
 class RoomStateBarManager:
     """
     管理整个房间的 StateBar，处理几何分割与动态更新
     """
-    def __init__(self, polygon_points, bar_length=0.5, fov_deg=90.0, threshold_bar_update=0.3):
+    def __init__(self, polygon_points, bar_length=0.5, fov_deg=90.0, threshold_bar_update=0.3, cam_intri_path=None):
         """
         :param polygon_points: List of (x,y) tuples. e.g. [(0,0), (4,0), (4,3), (0,3)]
+        :param cam_intri_path: Path to camera intrinsic json file
         """
         self.points = np.array(polygon_points)
         self.bar_length = bar_length
         self.fov_deg = fov_deg
         self.threshold_bar_update = threshold_bar_update
+        
+        # 加载内参
+        self.cam_intri = None
+        if cam_intri_path and os.path.exists(cam_intri_path):
+            try:
+                with open(cam_intri_path, 'r') as f:
+                    raw_intri = json.load(f)
+                self.cam_intri = self._parse_intrinsics(raw_intri)
+                print(f"[Manager] Loaded camera intrinsics from {cam_intri_path}")
+            except Exception as e:
+                print(f"[Manager] Failed to load intrinsics: {e}")
+
         self.edges = []
         self.bars = []
         self.total_perimeter = 0.0
@@ -67,6 +178,37 @@ class RoomStateBarManager:
         
         # 2. 分割并初始化 StateBars
         self._init_bars()
+
+    def _parse_intrinsics(self, raw_intri):
+        """
+        解析相机内参，统一转换为 {"fx": ..., "fy": ..., "cx": ..., "cy": ...} 格式
+        """
+        parsed = {}
+        # 1. Open3D / Standard dict: {"intrinsic_matrix": [fx, 0, cx, 0, fy, cy, 0, 0, 1]} (row-major)
+        if "intrinsic_matrix" in raw_intri:
+            k = raw_intri["intrinsic_matrix"]
+            k_flat = np.array(k).flatten()
+            if len(k_flat) >= 9:
+                parsed["fx"] = k_flat[0]
+                parsed["cx"] = k_flat[2]
+                parsed["fy"] = k_flat[4]
+                parsed["cy"] = k_flat[5]
+        # 2. ROS CameraInfo style (JSON): "k": [fx, 0, cx, 0, fy, cy, 0, 0, 1]
+        elif "k" in raw_intri and isinstance(raw_intri["k"], list) and len(raw_intri["k"]) >= 9:
+            k = raw_intri["k"]
+            # K matrix is 3x3 flattened: [fx, 0, cx, 0, fy, cy, 0, 0, 1]
+            parsed["fx"] = k[0]
+            parsed["cx"] = k[2]
+            parsed["fy"] = k[4]
+            parsed["cy"] = k[5]
+        # 3. Direct keys: {"fx": ..., "fy": ...}
+        elif "fx" in raw_intri and "fy" in raw_intri:
+            parsed["fx"] = raw_intri["fx"]
+            parsed["fy"] = raw_intri["fy"]
+            if "cx" in raw_intri: parsed["cx"] = raw_intri["cx"]
+            if "cy" in raw_intri: parsed["cy"] = raw_intri["cy"]
+            
+        return parsed if parsed else None
 
     def _init_geometry(self):
         num_points = len(self.points)
@@ -97,7 +239,8 @@ class RoomStateBarManager:
             actual_len = min(self.bar_length, self.total_perimeter - start_dist)
             
             if actual_len > 0.01: # 忽略极短的碎片
-                self.bars.append(StateBar(i, start_dist, actual_len))
+                # 将共享的 cam_intri 对象传递给每个 StateBar
+                self.bars.append(StateBar(i, start_dist, actual_len, cam_intri=self.cam_intri))
         print(f"[Manager] Created {len(self.bars)} StateBars.")
 
     def _get_bar_2d_segments(self, bar_idx):

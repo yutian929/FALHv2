@@ -21,7 +21,7 @@ class SemanticSegmentQuery(object):
         else:
             self.prompts = prompts
 
-class SemanticSegmenResponse(object):
+class SemanticSegmentResponse(object):
     """
     语义分割响应结果封装
     """
@@ -33,9 +33,6 @@ class SemanticSegmenResponse(object):
         self.results = {}
         if results is not None:
             self.results = results
-    
-    def to_dict(self):
-        return self.results
 
     def _update(self, pic_path, label, scores, boxes, masks, mask_scores):
         """
@@ -49,6 +46,9 @@ class SemanticSegmenResponse(object):
             "masks": masks,
             "mask_scores": mask_scores
         }
+    
+    def _dict_results(self):
+        return self.results
 
     def visualize(self, output_dir=None):
         """
@@ -115,25 +115,34 @@ class SemanticSegmenResponse(object):
             else:
                 result_image.show()
 
-class SemanticSegmenterLangSAM(object):
-    def __init__(self):
-        self.model = LangSAM()
+class SemanticSegmentorLangSAM(object):
+    def __init__(self, options=None):
+        self.options = options if options is not None else {}
+        
+        # 1. 从 options 中提取 sam_type
+        sam_type = self.options.get("sam_type", "sam2.1_hiera_small")
+        print(f"Loading LangSAM with sam_type: {sam_type}")
+        
+        # 2. 传递具体的参数给 LangSAM 构造函数
+        self.model = LangSAM(sam_type=sam_type)
 
-    def predict(self, query: SemanticSegmentQuery) -> SemanticSegmenResponse:
+    def predict(self, query: SemanticSegmentQuery, batch_max_size=1) -> SemanticSegmentResponse:
         """
         Detect objects defined in query.prompts within images at query.image_paths.
         
         Args:
             query (SemanticSegmentQuery): The query object containing image paths and prompts.
+            batch_max_size (int): Maximum number of images to process in one batch to avoid OOM.
             
         Returns:
-            SemanticSegmenResponse: The response object containing structured results.
+            SemanticSegmentResponse: The response object containing structured results.
         """
         image_paths = query.image_paths
         prompts = query.prompts
 
-        # Load all images
-        images_pil = [Image.open(p).convert("RGB") for p in image_paths]
+        # 3. 从 options 中提取预测阈值
+        box_threshold = self.options.get("box_threshold", 0.3)
+        text_threshold = self.options.get("text_threshold", 0.25)
 
         # Prepare the prompt string.
         # If multiple descriptions are given, join them with dots to detect all of them.
@@ -146,58 +155,109 @@ class SemanticSegmenterLangSAM(object):
             if not text_prompt.endswith("."):
                 text_prompt += "."
 
-        # LangSAM expects a list of prompts matching the list of images
-        batch_prompts = [text_prompt] * len(images_pil)
-
-        # Predict
-        # When passing lists, LangSAM returns a list of dictionaries
-        raw_results = self.model.predict(images_pil, batch_prompts)
-        ssr = SemanticSegmenResponse()
+        ssr = SemanticSegmentResponse()
+        total_images = len(image_paths)
         
-        for path, res in zip(image_paths, raw_results):
-            # Get all detected labels for this image
-            # 'text_labels' contains the specific prompt matched (e.g. 'vase', 'chair')
-            labels = res.get("text_labels", [])
+        # Process in batches
+        for start_idx in range(0, total_images, batch_max_size):
+            end_idx = min(start_idx + batch_max_size, total_images)
+            batch_paths = image_paths[start_idx:end_idx]
             
-            # Identify unique labels to group by
-            unique_labels = set(labels)
+            print(f"Processing batch {start_idx+1}-{end_idx}/{total_images}...")
             
-            for label in unique_labels:
-                # Find all indices corresponding to this label
-                indices = [i for i, x in enumerate(labels) if x == label]
-                
-                # Use numpy indexing to extract the subset of data for this label
-                ssr._update(
-                    pic_path=path,
-                    label=label,
-                    scores=res["scores"][indices],
-                    boxes=res["boxes"][indices],
-                    masks=res["masks"][indices],
-                    mask_scores=res["mask_scores"][indices]
+            # Load images for this batch
+            batch_images_pil = [Image.open(p).convert("RGB") for p in batch_paths]
+            
+            # LangSAM expects a list of prompts matching the list of images
+            batch_prompts = [text_prompt] * len(batch_images_pil)
+
+            # Predict
+            # When passing lists, LangSAM returns a list of dictionaries
+            try:
+                # 4. 传递具体的阈值参数给 predict
+                raw_results = self.model.predict(
+                    batch_images_pil, 
+                    batch_prompts, 
+                    box_threshold=box_threshold, 
+                    text_threshold=text_threshold
                 )
+            except RuntimeError as e:
+                if "out of memory" in str(e):
+                    print(f"CUDA OOM Error in batch {start_idx+1}-{end_idx}. Try reducing batch_max_size.")
+                    import torch
+                    torch.cuda.empty_cache()
+                raise e
+            
+            for path, res in zip(batch_paths, raw_results):
+                # Fix for 0-d arrays from LangSAM (specifically mask_scores when single detection)
+                if "mask_scores" in res and np.ndim(res["mask_scores"]) == 0:
+                    res["mask_scores"] = np.array([res["mask_scores"]])
+                
+                if "scores" in res and np.ndim(res["scores"]) == 0:
+                    res["scores"] = np.array([res["scores"]])
+
+                # Get all detected labels for this image
+                # 'text_labels' contains the specific prompt matched (e.g. 'vase', 'chair')
+                labels = res.get("text_labels", [])
+                
+                # Identify unique labels to group by
+                unique_labels = set(labels)
+                
+                for label in unique_labels:
+                    # Find all indices corresponding to this label
+                    indices = [i for i, x in enumerate(labels) if x == label]
+                    
+                    # Use numpy indexing to extract the subset of data for this label
+                    ssr._update(
+                        pic_path=path,
+                        label=label,
+                        scores=res["scores"][indices],
+                        boxes=res["boxes"][indices],
+                        masks=res["masks"][indices],
+                        mask_scores=res["mask_scores"][indices]
+                    )
         
         return ssr
 
+class SemanticSegmentor(object):
+    """
+    语义分割接口类
+    """
+    def __init__(self, segmentor_type="lang_sam", options=None):
+        self.segmentor = None
+        if segmentor_type == "lang_sam":
+            self.segmentor = SemanticSegmentorLangSAM(options)
+        else:
+            raise ValueError(f"Unsupported segmentor type: {segmentor_type}")
+
+    def predict(self, query: SemanticSegmentQuery, batch_max_size=8) -> SemanticSegmentResponse:
+        return self.segmentor.predict(query, batch_max_size=batch_max_size)
+
 if __name__ == "__main__":
     # Example usage
-    segmenter = SemanticSegmenterLangSAM()
+    options = {
+        "sam_type": "sam2.1_hiera_small",
+        "box_threshold": 0.3,
+        "text_threshold": 0.25
+    }
+    segmentor = SemanticSegmentor("lang_sam", options)
     
-    image_paths = ["111.png", "222.png"]  # Example image paths
+    image_paths = ["asserts/111.png", "asserts/222.png"]  # Example image paths
     prompts = ["vase", "chair"] # Detect both vase and chair
     
     # Create Query object
     query = SemanticSegmentQuery(image_paths, prompts)
     
     # Get Response object
-    response = segmenter.predict(query)
-    results = response.to_dict()
+    response = segmentor.predict(query)
+    results = response._dict_results()
     
     # Visualize results
-    response.visualize(output_dir="vis_results")
+    response.visualize()
     
     # Print structure to verify
     for path, labels_data in results.items():
         print(f"Results for {path}:")
         for label, data in labels_data.items():
-            print(f"  Label: '{label}' found {len(data['boxes'])} times.")
+            print(f"    Label: '{label}' found {len(data['boxes'])} times.")
             print(f"    Scores: {data['scores']}")
