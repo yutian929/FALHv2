@@ -1,10 +1,26 @@
 from PIL import Image
-from lang_sam import LangSAM
 import numpy as np
+
+# Try importing LangSAM components
+try:
+    from lang_sam import LangSAM
+    LANG_SAM_AVAILABLE = True
+except ImportError:
+    LANG_SAM_AVAILABLE = False
+    print("Warning: LangSAM modules not found.")
+
+# Try importing SAM3 components
+try:
+    from sam3.model_builder import build_sam3_image_model
+    from sam3.model.sam3_image_processor import Sam3Processor
+    SAM3_AVAILABLE = True
+except ImportError:
+    SAM3_AVAILABLE = False
+    print("Warning: SAM3 modules not found.")
 
 class SemanticSegmentQuery(object):
     """
-    语义分割查询接口，基于 LangSAM 模型
+    语义分割查询接口
     """
     def __init__(self, image_paths, prompts):
         """
@@ -23,7 +39,7 @@ class SemanticSegmentQuery(object):
 
 class SemanticSegmentResponse(object):
     """
-    语义分割响应结果封装
+    语义分割响应结果
     """
     def __init__(self, results=None):
         """
@@ -117,11 +133,13 @@ class SemanticSegmentResponse(object):
 
 class SemanticSegmentorLangSAM(object):
     def __init__(self, options=None):
+        if not LANG_SAM_AVAILABLE:
+            raise ImportError("LangSAM modules are not available. Please check your installation.")
         self.options = options if options is not None else {}
         
         # 1. 从 options 中提取 sam_type
         sam_type = self.options.get("sam_type", "sam2.1_hiera_small")
-        print(f"Loading LangSAM with sam_type: {sam_type}")
+        print(f"Loading LangSAM with options: {self.options}")
         
         # 2. 传递具体的参数给 LangSAM 构造函数
         self.model = LangSAM(sam_type=sam_type)
@@ -137,7 +155,7 @@ class SemanticSegmentorLangSAM(object):
         Returns:
             SemanticSegmentResponse: The response object containing structured results.
         """
-        image_paths = query.image_paths
+        image_inputs = query.image_paths
         prompts = query.prompts
 
         # 3. 从 options 中提取预测阈值
@@ -156,18 +174,50 @@ class SemanticSegmentorLangSAM(object):
                 text_prompt += "."
 
         ssr = SemanticSegmentResponse()
-        total_images = len(image_paths)
+        total_images = len(image_inputs)
         
         # Process in batches
         for start_idx in range(0, total_images, batch_max_size):
             end_idx = min(start_idx + batch_max_size, total_images)
-            batch_paths = image_paths[start_idx:end_idx]
+            batch_inputs = image_inputs[start_idx:end_idx]
             
             print(f"Processing batch {start_idx+1}-{end_idx}/{total_images}...")
             
             # Load images for this batch
-            batch_images_pil = [Image.open(p).convert("RGB") for p in batch_paths]
+            batch_images_pil = []
+            batch_keys = [] # To keep track of which result belongs to which input (path or index)
+
+            for i, inp in enumerate(batch_inputs):
+                img = None
+                key = None
+                
+                if isinstance(inp, str):
+                    # It's a file path
+                    try:
+                        img = Image.open(inp).convert("RGB")
+                        key = inp
+                    except Exception as e:
+                        print(f"Error opening image {inp}: {e}")
+                elif isinstance(inp, np.ndarray):
+                    # It's a numpy array (e.g. from mediapy/cv2)
+                    try:
+                        img = Image.fromarray(inp).convert("RGB")
+                        # Use index as key for in-memory images
+                        key = f"image_{start_idx + i}" 
+                    except Exception as e:
+                        print(f"Error converting numpy array to PIL: {e}")
+                elif isinstance(inp, Image.Image):
+                    # It's already a PIL image
+                    img = inp.convert("RGB")
+                    key = f"image_{start_idx + i}"
+                
+                if img is not None:
+                    batch_images_pil.append(img)
+                    batch_keys.append(key)
             
+            if not batch_images_pil:
+                continue
+
             # LangSAM expects a list of prompts matching the list of images
             batch_prompts = [text_prompt] * len(batch_images_pil)
 
@@ -188,7 +238,7 @@ class SemanticSegmentorLangSAM(object):
                     torch.cuda.empty_cache()
                 raise e
             
-            for path, res in zip(batch_paths, raw_results):
+            for key, res in zip(batch_keys, raw_results):
                 # Fix for 0-d arrays from LangSAM (specifically mask_scores when single detection)
                 if "mask_scores" in res and np.ndim(res["mask_scores"]) == 0:
                     res["mask_scores"] = np.array([res["mask_scores"]])
@@ -209,7 +259,7 @@ class SemanticSegmentorLangSAM(object):
                     
                     # Use numpy indexing to extract the subset of data for this label
                     ssr._update(
-                        pic_path=path,
+                        pic_path=key,
                         label=label,
                         scores=res["scores"][indices],
                         boxes=res["boxes"][indices],
@@ -217,6 +267,98 @@ class SemanticSegmentorLangSAM(object):
                         mask_scores=res["mask_scores"][indices]
                     )
         
+        return ssr
+
+class SemanticSegmentorSAM3(object):
+    def __init__(self, options=None):
+        if not SAM3_AVAILABLE:
+            raise ImportError("SAM3 modules are not available. Please check your installation.")
+        
+        self.options = options if options is not None else {}
+        print(f"Loading SAM3 model with options: {self.options}...")
+        self.model = build_sam3_image_model()
+        self.processor = Sam3Processor(self.model)
+
+    def predict(self, query: SemanticSegmentQuery, batch_max_size=1) -> SemanticSegmentResponse:
+        """
+        Detect objects defined in query.prompts within images at query.image_paths.
+        Note: SAM3 processes images sequentially in this implementation.
+        """
+        ssr = SemanticSegmentResponse()
+        
+        prompts_list = query.prompts if isinstance(query.prompts, list) else [query.prompts]
+        # Clean prompts
+        prompts_list = [p.strip().rstrip(".") for p in prompts_list]
+
+        total_images = len(query.image_paths)
+        for idx, inp in enumerate(query.image_paths):
+            print(f"Processing image {idx+1}/{total_images}...")
+            
+            image = None
+            key = None
+            
+            if isinstance(inp, str):
+                try:
+                    image = Image.open(inp).convert("RGB")
+                    key = inp
+                except Exception as e:
+                    print(f"Error opening image {inp}: {e}")
+                    continue
+            elif isinstance(inp, np.ndarray):
+                try:
+                    image = Image.fromarray(inp).convert("RGB")
+                    key = f"image_{idx}"
+                except Exception as e:
+                    print(f"Error converting numpy array to PIL: {e}")
+                    continue
+            elif isinstance(inp, Image.Image):
+                image = inp.convert("RGB")
+                key = f"image_{idx}"
+
+            if image is None:
+                continue
+
+            # Set image
+            inference_state = self.processor.set_image(image)
+
+            for prompt in prompts_list:
+                # Predict for each prompt
+                output = self.processor.set_text_prompt(state=inference_state, prompt=prompt)
+                
+                masks = output["masks"]
+                boxes = output["boxes"]
+                scores = output["scores"]
+
+                if masks is None or boxes is None or len(boxes) == 0:
+                    continue
+
+                # Convert to numpy
+                # Ensure tensors are float32 before converting to numpy (fixes BFloat16 error)
+                masks_np = masks.detach().float().cpu().numpy()
+                # [N, 1, H, W] -> [N, H, W]
+                if masks_np.ndim == 4 and masks_np.shape[1] == 1:
+                    masks_np = masks_np.squeeze(1)
+                
+                # Threshold masks (SAM3 returns logits or probs, usually > 0 for binary)
+                masks_np = (masks_np > 0).astype(bool)
+
+                boxes_np = boxes.detach().float().cpu().numpy()
+                scores_np = scores.detach().float().cpu().numpy()
+
+                # Fix 0-d arrays
+                if np.ndim(scores_np) == 0:
+                    scores_np = np.array([scores_np])
+                
+                # Update response
+                ssr._update(
+                    pic_path=key,
+                    label=prompt,
+                    scores=scores_np,
+                    boxes=boxes_np,
+                    masks=masks_np,
+                    mask_scores=scores_np # Reusing scores as mask_scores
+                )
+                
         return ssr
 
 class SemanticSegmentor(object):
@@ -227,6 +369,8 @@ class SemanticSegmentor(object):
         self.segmentor = None
         if segmentor_type == "lang_sam":
             self.segmentor = SemanticSegmentorLangSAM(options)
+        elif segmentor_type == "sam3":
+            self.segmentor = SemanticSegmentorSAM3(options)
         else:
             raise ValueError(f"Unsupported segmentor type: {segmentor_type}")
 
@@ -235,12 +379,16 @@ class SemanticSegmentor(object):
 
 if __name__ == "__main__":
     # Example usage
-    options = {
-        "sam_type": "sam2.1_hiera_small",
-        "box_threshold": 0.3,
-        "text_threshold": 0.25
-    }
-    segmentor = SemanticSegmentor("lang_sam", options)
+    # >>> lang_sam segmentor
+    # options = {
+    #     "sam_type": "sam2.1_hiera_small",
+    #     "box_threshold": 0.3,
+    #     "text_threshold": 0.25
+    # }
+    # segmentor = SemanticSegmentor("lang_sam", options)
+    # >>> sam3 segmentor
+    options = {}
+    segmentor = SemanticSegmentor("sam3", options)
     
     image_paths = ["asserts/111.png", "asserts/222.png"]  # Example image paths
     prompts = ["vase", "chair"] # Detect both vase and chair
@@ -251,7 +399,7 @@ if __name__ == "__main__":
     # Get Response object
     response = segmentor.predict(query)
     results = response._dict_results()
-    
+
     # Visualize results
     response.visualize()
     
