@@ -1,65 +1,100 @@
 import os
+import glob
 import json
 import numpy as np
 import cv2
-import mediapy
+# import mediapy # 不再需要
 from scipy.spatial.transform import Rotation as R
 
 # ============================
-# 配置（沿用你原来的路径）
+# 1. 配置路径 (根据你的截图适配)
 # ============================
-DATA_DIR = "/home/yutian/FALHv2/data/output"
-CAM_LINK_TRAJ_PATH = os.path.join(DATA_DIR, "camera_link_traj.json")
-COLOR_VIDEO_PATH = os.path.join(DATA_DIR, "video_L.mp4")
-DEPTH_PATH = os.path.join(DATA_DIR, "depth.npy")
+# 指向包含 color, depth, pose 文件夹的根目录
+DATA_ROOT = "data/rtabmap_samples" 
+
+DIRS = {
+    'color': os.path.join(DATA_ROOT, "color"),
+    'depth': os.path.join(DATA_ROOT, "depth"),
+    'pose':  os.path.join(DATA_ROOT, "pose"),
+}
 
 # 输出目录：prior/<index>/
-OUTPUT_ROOT = os.path.join(DATA_DIR, "prior")
+OUTPUT_ROOT = os.path.join(DATA_ROOT, "prior")
 
-WINDOW_NAME = "RGB | DEPTH  (a/d switch, s save by index, q/esc quit)"
-FALLBACK_DEPTH_MAX = 3.0  # 深度可视化的兜底最大值（米），如果估计失败就用它
+WINDOW_NAME = "RGB | DEPTH (Folder Mode)"
+FALLBACK_DEPTH_MAX = 3.0 
 
 
-def load_trajectory(json_path):
+def get_sorted_indices(dir_path, extension):
     """
-    Load trajectory from JSON and convert to dict: frame_index (int) -> 4x4 numpy array
+    获取文件夹下所有指定后缀文件的索引（假设文件名是 0.png, 1.png ...）
+    返回排序后的 int 列表
     """
-    with open(json_path, 'r') as f:
-        data = json.load(f)
+    if not os.path.exists(dir_path):
+        return []
+    files = glob.glob(os.path.join(dir_path, f"*{extension}"))
+    indices = []
+    for f in files:
+        basename = os.path.basename(f)
+        name_no_ext = os.path.splitext(basename)[0]
+        # 过滤掉非数字命名的文件（如 _meta.json 等）
+        if name_no_ext.isdigit():
+            indices.append(int(name_no_ext))
+    return sorted(indices)
 
+
+def load_poses_from_folder(pose_dir, indices):
+    """
+    直接读取保存好的 4x4 numpy 矩阵
+    返回: dict { index: 4x4_matrix }
+    """
     poses = {}
-    for key, value in data.items():
-        idx = int(key)
-        p = value['pose']
-
-        t = np.array([p['tx'], p['ty'], p['tz']], dtype=np.float64)
-        q = [p['qx'], p['qy'], p['qz'], p['qw']]  # [x,y,z,w]
-        r = R.from_quat(q).as_matrix()
-
-        mat = np.eye(4, dtype=np.float64)
-        mat[:3, :3] = r
-        mat[:3, 3] = t
-        poses[idx] = mat
+    print(f"Loading poses from {pose_dir}...")
+    for idx in indices:
+        path = os.path.join(pose_dir, f"{idx}.npy")
+        if os.path.exists(path):
+            try:
+                mat = np.load(path) # 应该是 4x4 矩阵
+                poses[idx] = mat
+            except Exception as e:
+                print(f"Error loading pose {idx}: {e}")
     return poses
 
 
-def _to_uint8_rgb(frame):
+def load_images_from_folder(color_dir, indices):
     """
-    mediapy 读出来可能是 uint8 或 float；统一成 uint8 RGB
+    读取所有 RGB 图片
+    返回: dict { index: image_uint8_bgr } (注意：OpenCV读取默认是BGR)
     """
-    if frame.dtype == np.uint8:
-        return frame
-    # 常见：float in [0,1] 或 [0,255]
-    f = frame.astype(np.float32)
-    if f.max() <= 1.5:
-        f = f * 255.0
-    f = np.clip(f, 0, 255).astype(np.uint8)
-    return f
+    images = {}
+    print(f"Loading images from {color_dir}...")
+    for idx in indices:
+        path = os.path.join(color_dir, f"{idx}.png")
+        if os.path.exists(path):
+            img = cv2.imread(path) # BGR uint8
+            if img is not None:
+                images[idx] = img
+    return images
+
+
+def load_depths_from_folder(depth_dir, indices):
+    """
+    读取所有深度 .npy
+    返回: dict { index: depth_map_float }
+    """
+    depths = {}
+    print(f"Loading depths from {depth_dir}...")
+    for idx in indices:
+        path = os.path.join(depth_dir, f"{idx}.npy")
+        if os.path.exists(path):
+            d = np.load(path)
+            depths[idx] = d
+    return depths
 
 
 def depth_to_colormap(depth):
     """
-    depth: (H,W), float/uint16/...
+    depth: (H,W), float
     输出: (H,W,3) BGR, 用于 cv2.imshow
     """
     d = depth.astype(np.float32)
@@ -67,6 +102,7 @@ def depth_to_colormap(depth):
     valid = np.isfinite(d) & (d > 0)
     if np.any(valid):
         dv = d[valid]
+        # 简单的百分位截断，防止噪声点影响可视化
         dmin = float(np.percentile(dv, 2))
         dmax = float(np.percentile(dv, 98))
         if dmax - dmin < 1e-6:
@@ -91,173 +127,144 @@ def draw_text(img_bgr, lines, org=(10, 25), line_h=22):
     return img_bgr
 
 
-def render_view(idx, video_frames, all_depths, traj_data):
+def render_view(idx, images_dict, depths_dict, poses_dict):
     """
-    返回一个可视化用的 BGR 图：左RGB右DEPTH
+    返回一个可视化用的 BGR 图
     """
-    rgb = _to_uint8_rgb(video_frames[idx])           # RGB uint8
-    depth = all_depths[idx]                          # (H,W)
+    # 容错处理：如果当前帧缺少数据
+    if idx not in images_dict or idx not in depths_dict:
+        # 创建一个黑色的空图提示错误
+        blank = np.zeros((480, 640, 3), dtype=np.uint8)
+        return draw_text(blank, [f"Frame {idx} MISSING DATA (Check folders)"])
 
-    # RGB -> BGR for OpenCV
-    rgb_bgr = cv2.cvtColor(rgb, cv2.COLOR_RGB2BGR)
+    rgb_bgr = images_dict[idx] # 已经是 BGR
+    depth = depths_dict[idx]
 
+    # 生成彩色深度图
     depth_bgr, (dmin, dmax) = depth_to_colormap(depth)
 
-    # 尺寸对齐
-    h = min(rgb_bgr.shape[0], depth_bgr.shape[0])
-    w1 = int(rgb_bgr.shape[1] * (h / rgb_bgr.shape[0]))
+    # 尺寸对齐 (以 RGB 高度为准)
+    h = rgb_bgr.shape[0]
+    w1 = rgb_bgr.shape[1]
     w2 = int(depth_bgr.shape[1] * (h / depth_bgr.shape[0]))
-    rgb_bgr = cv2.resize(rgb_bgr, (w1, h), interpolation=cv2.INTER_AREA)
     depth_bgr = cv2.resize(depth_bgr, (w2, h), interpolation=cv2.INTER_NEAREST)
 
     view = np.concatenate([rgb_bgr, depth_bgr], axis=1)
 
-    # pose 信息
-    if idx in traj_data:
-        T = traj_data[idx]
+    # Pose 信息
+    if idx in poses_dict:
+        T = poses_dict[idx]
         t = T[:3, 3]
         euler = R.from_matrix(T[:3, :3]).as_euler('xyz', degrees=True)
-        pose_line = f"traj: t=[{t[0]:.3f},{t[1]:.3f},{t[2]:.3f}]  euler_xyz(deg)=[{euler[0]:.1f},{euler[1]:.1f},{euler[2]:.1f}]"
+        pose_line = f"traj: t=[{t[0]:.3f},{t[1]:.3f},{t[2]:.3f}]  euler=[{euler[0]:.1f},{euler[1]:.1f},{euler[2]:.1f}]"
     else:
-        pose_line = "traj: MISSING for this index"
+        pose_line = "traj: MISSING"
 
     info = [
-        f"Index: {idx} / {len(video_frames)-1}",
-        f"depth vis range: [{dmin:.3f}, {dmax:.3f}]",
+        f"Frame: {idx}",
+        f"Depth range: [{dmin:.2f}m, {dmax:.2f}m]",
         pose_line,
-        "Keys: a(prev) d(next) s(save by index) q/ESC(quit)"
+        "Keys: a(prev) d(next) s(save) q(quit)"
     ]
     view = draw_text(view, info)
     return view
 
 
 def input_index_via_keys(base_view):
-    """
-    在 OpenCV 窗口里捕获数字输入：
-    - 输入数字
-    - Backspace 删除
-    - Enter 确认
-    - ESC 取消
-    """
+    """ 数字输入逻辑 """
     buf = ""
     while True:
         tmp = base_view.copy()
-        prompt = f"Type Index then ENTER (ESC cancel): {buf}"
-        tmp = draw_text(tmp, [prompt], org=(10, 25), line_h=24)
+        prompt = f"Save Index: {buf}_  (Enter to confirm)"
+        tmp = draw_text(tmp, [prompt], org=(10, 200), line_h=30)
         cv2.imshow(WINDOW_NAME, tmp)
 
-        k = cv2.waitKey(30) & 0xFF
-        if k == 27:  # ESC
-            return None
-        if k in (10, 13):  # Enter
-            return buf if buf.strip() != "" else None
-        if k in (8, 127):  # Backspace
-            buf = buf[:-1]
-            continue
-        if ord('0') <= k <= ord('9'):
-            buf += chr(k)
-            continue
-        # 其他键忽略
+        k = cv2.waitKey(0) & 0xFF
+        if k == 27: return None # ESC
+        if k in (10, 13): return buf if buf else None # Enter
+        if k in (8, 127): buf = buf[:-1]; continue # Backspace
+        if ord('0') <= k <= ord('9'): buf += chr(k); continue
 
 
-def save_prior(index, video_frames, all_depths, traj_data, output_root):
+def save_prior(index, images_dict, depths_dict, poses_dict, output_root):
     """
-    保存 rgb/depth/traj 到 prior/<index>/
+    保存单个样本到 prior/ 文件夹
     """
-    if index < 0 or index >= len(video_frames) or index >= len(all_depths):
-        print(f"[Save] Index out of range: {index}")
-        return False
-    if index not in traj_data:
-        print(f"[Save] Trajectory missing for index: {index}")
+    if index not in images_dict:
+        print(f"[Error] Index {index} not found in memory.")
         return False
 
     out_dir = os.path.join(output_root, str(index))
     os.makedirs(out_dir, exist_ok=True)
 
-    rgb = _to_uint8_rgb(video_frames[index])  # RGB uint8
-    depth = all_depths[index]
-    T = traj_data[index]
+    # 保存图片
+    cv2.imwrite(os.path.join(out_dir, "rgb.png"), images_dict[index])
+    
+    # 保存原始 numpy 数据
+    # 注意：这里我们把 BGR 转回 RGB 保存，以便保持数据纯洁性，或者直接保存 BGR 也行，看你后续算法需求
+    # 通常 AI 模型喜欢 RGB
+    img_rgb = cv2.cvtColor(images_dict[index], cv2.COLOR_BGR2RGB)
+    np.save(os.path.join(out_dir, "rgb.npy"), img_rgb)
+    
+    np.save(os.path.join(out_dir, "depth.npy"), depths_dict[index])
+    
+    if index in poses_dict:
+        T = poses_dict[index]
+        np.save(os.path.join(out_dir, "cam_T_world.npy"), T)
+        # 顺便存个 json 方便人看
+        with open(os.path.join(out_dir, "cam_T_world.json"), "w") as f:
+            json.dump({"cam_T_world": T.tolist()}, f, indent=2)
 
-    # rgb.png (BGR for cv2.imwrite)
-    cv2.imwrite(os.path.join(out_dir, "rgb.png"), cv2.cvtColor(rgb, cv2.COLOR_RGB2BGR))
-    # 原始数组
-    np.save(os.path.join(out_dir, "rgb.npy"), rgb)
-    np.save(os.path.join(out_dir, "depth.npy"), depth)
-    np.save(os.path.join(out_dir, "cam_T_world.npy"), T)
-
-    with open(os.path.join(out_dir, "cam_T_world.json"), "w") as f:
-        json.dump({"cam_T_world": T.tolist()}, f, indent=2)
-
-    print(f"[Save] Saved index {index} -> {out_dir}")
+    print(f"[Success] Saved frame {index} to {out_dir}")
     return True
 
 
 def main():
-    # 1) traj
-    if not os.path.exists(CAM_LINK_TRAJ_PATH):
-        raise FileNotFoundError(f"Trajectory file not found: {CAM_LINK_TRAJ_PATH}")
-    traj_data = load_trajectory(CAM_LINK_TRAJ_PATH)
-    print(f"Loaded {len(traj_data)} poses from {CAM_LINK_TRAJ_PATH}")
+    # 1. 扫描文件夹，获取所有共有索引
+    print("Scanning directories...")
+    # 以 color 文件夹为基准
+    indices = get_sorted_indices(DIRS['color'], ".png")
+    
+    if not indices:
+        print(f"No .png files found in {DIRS['color']}!")
+        return
 
-    # 2) depth
-    if not os.path.exists(DEPTH_PATH):
-        raise FileNotFoundError(f"Depth file not found: {DEPTH_PATH}")
-    all_depths = np.load(DEPTH_PATH)
-    print(f"Loaded depth data: shape={all_depths.shape}, dtype={all_depths.dtype}")
+    print(f"Found {len(indices)} frames. Range: {indices[0]} -> {indices[-1]}")
 
-    # 3) video
-    if not os.path.exists(COLOR_VIDEO_PATH):
-        raise FileNotFoundError(f"Video file not found: {COLOR_VIDEO_PATH}")
-    video_frames = mediapy.read_video(COLOR_VIDEO_PATH)
-    # mediapy 返回 (T,H,W,3)
-    if isinstance(video_frames, list):
-        video_frames = np.asarray(video_frames)
-    print(f"Loaded video: shape={video_frames.shape}, dtype={video_frames.dtype}")
+    # 2. 加载数据
+    images_dict = load_images_from_folder(DIRS['color'], indices)
+    depths_dict = load_depths_from_folder(DIRS['depth'], indices)
+    poses_dict  = load_poses_from_folder(DIRS['pose'], indices)
 
-    # 对齐长度
-    max_idx = min(len(video_frames), len(all_depths), max(traj_data.keys()) + 1)
-    video_frames = video_frames[:max_idx]
-    all_depths = all_depths[:max_idx]
-    print(f"Aligned length: {max_idx} frames")
-
+    # 3. 创建输出目录
     os.makedirs(OUTPUT_ROOT, exist_ok=True)
-    print(f"Output root: {OUTPUT_ROOT}")
 
-    # UI loop
-    idx = 0
+    # 4. 显示循环
+    curr_ptr = 0 # 指针，指向 indices 列表的下标
+    
     cv2.namedWindow(WINDOW_NAME, cv2.WINDOW_NORMAL)
 
     while True:
-        view = render_view(idx, video_frames, all_depths, traj_data)
+        idx = indices[curr_ptr] # 获取实际的文件编号（比如 0, 10, 20...）
+        
+        view = render_view(idx, images_dict, depths_dict, poses_dict)
         cv2.imshow(WINDOW_NAME, view)
 
         k = cv2.waitKey(0) & 0xFF
-        if k in (27, ord('q')):  # ESC / q
+
+        if k in (27, ord('q')): # Quit
             break
-        elif k == ord('a'):
-            idx = max(0, idx - 1)
-        elif k == ord('d'):
-            idx = min(max_idx - 1, idx + 1)
-        elif k == ord('s'):
-            # 输入任意 index（不一定是当前 idx）
-            s = input_index_via_keys(view)
-            if s is None:
-                print("[Save] Canceled.")
-                continue
-            try:
-                target = int(s)
-            except ValueError:
-                print(f"[Save] Invalid index input: {s}")
-                continue
-            ok = save_prior(target, video_frames, all_depths, traj_data, OUTPUT_ROOT)
-            # 保存后给个小提示（不影响主流程）
-            if ok:
-                # 可选：保存成功后自动跳到该帧
-                idx = max(0, min(max_idx - 1, target))
+        elif k == ord('a'): # Prev
+            curr_ptr = max(0, curr_ptr - 1)
+        elif k == ord('d'): # Next
+            curr_ptr = min(len(indices) - 1, curr_ptr + 1)
+        elif k == ord('s'): # Save
+            # 默认保存当前帧，或者你可以启用 input_index_via_keys 手动输数字
+            # 为了方便，这里直接改为“保存当前显示的帧”
+            save_prior(idx, images_dict, depths_dict, poses_dict, OUTPUT_ROOT)
 
     cv2.destroyAllWindows()
-    print("Exit.")
-
+    print("Viewer closed.")
 
 if __name__ == "__main__":
     main()

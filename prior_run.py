@@ -15,7 +15,7 @@ from scipy.spatial.transform import Rotation as R
 # ============================
 # 配置
 # ============================
-DATA_DIR = "/home/yutian/FALHv2/data/output"
+DATA_DIR = "data/rtabmap_samples" 
 PRIOR_ROOT = os.path.join(DATA_DIR, "prior")
 OUT_ROOT = os.path.join(DATA_DIR, "prior_results")
 
