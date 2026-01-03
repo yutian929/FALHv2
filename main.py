@@ -8,8 +8,8 @@ import matplotlib.pyplot as plt
 import matplotlib.patches as patches
 from scipy.spatial.transform import Rotation as R
 
-from room_state_bar import RoomStateBarManager
-from semantic_segmentor import SemanticSegmentQuery, SemanticSegmentResponse, SemanticSegmentor
+from falhv2.room_state_bar import RoomStateBarManager
+from falhv2.semantic_segmentor import SemanticSegmentQuery, SemanticSegmentResponse, SemanticSegmentor
 
 # ============================
 # 宏定义 / 配置参数

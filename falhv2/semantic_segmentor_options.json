@@ -1,0 +1,8 @@
+{
+    "lang_sam":{
+        "sam_type": "sam2.1_hiera_large",
+        "box_threshold": 0.8,
+        "text_threshold": 0.3
+    },
+    "sam3":{}
+}

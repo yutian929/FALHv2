@@ -390,7 +390,7 @@ if __name__ == "__main__":
     options = {}
     segmentor = SemanticSegmentor("sam3", options)
     
-    image_paths = ["asserts/111.png", "asserts/222.png"]  # Example image paths
+    image_paths = ["../asserts/111.png", "../asserts/222.png"]  # Example image paths
     prompts = ["vase", "chair"] # Detect both vase and chair
     
     # Create Query object
